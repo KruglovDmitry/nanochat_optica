@@ -13,11 +13,12 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1,2,3,4,5,6,7"
 import time
 from contextlib import nullcontext
 
-import wandb
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
@@ -31,18 +32,18 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # User settings
-run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
+run = "nanochat_optica" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
-device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
+device_type = "cuda" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
-depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
+depth = 4 # 20 # the depth of the Transformer model to train, rest of the kwargs are derived
+max_seq_len = 512 #2048 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 32 # per-device batch size (set to not OOM)
+device_batch_size = 4 # per-device batch size (set to not OOM)
 total_batch_size = 524288 # total desired batch size, in #tokens
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
@@ -55,7 +56,7 @@ final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
-eval_tokens = 20*524288 # number of tokens to evaluate val loss on
+eval_tokens = 512 # 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
@@ -76,9 +77,11 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
-# wandb logging init
-use_dummy_wandb = run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
+# logging init
+if master_process:
+    writer = SummaryWriter(log_dir=f"runs/{run}")  # Папка runs/nanochat
+else:
+    writer = None 
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
@@ -111,9 +114,14 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
-with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+model_config = GPTConfig(**model_config_kwargs)
+if device_type == "cuda":
+    # Создаем модель напрямую на целевом устройстве
+    model = GPT(model_config).to(device)
+else:
+    # Используем meta только для CPU
+    with torch.device("meta"):
+        model = GPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -225,12 +233,8 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
+        if writer:
+            writer.add_scalar("val/bpb", val_bpb, step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -241,12 +245,8 @@ while True:
         with autocast_ctx:
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
+        if writer:
+            writer.add_scalar("eval/core_metric", results["core_metric"], step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -344,20 +344,13 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-        }
+    if writer and step % 100 == 0:
+        writer.add_scalar("train/loss", debiased_smooth_loss, step)
+        writer.add_scalar("train/learning_rate_multiplier", lrm, step)
+        writer.add_scalar("train/tokens_per_sec", tok_per_sec, step)
+        writer.add_scalar("train/mfu", mfu, step)
         if grad_clip_enabled:
-            log_data["train/grad_norm"] = grad_norm
-        wandb_run.log(log_data)
+            writer.add_scalar("train/grad_norm", grad_norm, step)
 
     # state update
     step += 1
@@ -394,5 +387,6 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+if writer:
+    writer.close()
 compute_cleanup()

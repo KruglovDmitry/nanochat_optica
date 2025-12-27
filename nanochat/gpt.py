@@ -23,14 +23,88 @@ from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
+import sys
+sys.path.insert(1, r'/wd/Optical_matrix_multiplication')
+import source
+from source import propagator
+
 @dataclass
 class GPTConfig:
-    sequence_len: int = 1024
+    sequence_len: int = 512
     vocab_size: int = 50304
-    n_layer: int = 12
+    n_layer: int = 4
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+
+step = 1
+pixel_size: float = 3.6e-6
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+USE_OPTICA = True
+max_seq_len: int =  512
+
+config_scores = source.Config(right_matrix_count_columns = GPTConfig.sequence_len,
+                    right_matrix_count_rows = GPTConfig.sequence_len // GPTConfig.n_layer,
+                    right_matrix_width = pixel_size * GPTConfig.sequence_len,
+                    right_matrix_height = pixel_size * (GPTConfig.sequence_len // GPTConfig.n_layer),
+                    min_height_gap = pixel_size,
+                    right_matrix_split_x = 2,
+                    right_matrix_split_y = 2,
+                    left_matrix_split_x = 2,
+                    left_matrix_split_y = 2,
+                    result_matrix_split = 2,
+                    distance = 0.15,
+                    lens_size = 8192 * 2)
+
+config_output = source.Config(right_matrix_count_columns = GPTConfig.sequence_len // GPTConfig.n_layer,
+                    right_matrix_count_rows = GPTConfig.sequence_len,
+                    right_matrix_width = pixel_size * (GPTConfig.sequence_len // GPTConfig.n_layer),
+                    right_matrix_height = pixel_size * GPTConfig.sequence_len,
+                    min_height_gap = pixel_size,
+                    right_matrix_split_x = 2,
+                    right_matrix_split_y = 2,
+                    left_matrix_split_x = 2,
+                    left_matrix_split_y = 2,
+                    result_matrix_split = 2,
+                    distance = 0.15,
+                    lens_size = 8192 * 2)
+        
+sim_scores = source.DataParallel(source.OpticalMul(config_scores))
+sim_output = source.DataParallel(source.OpticalMul(config_output))                    
+
+def optics_norm(matrix: torch.Tensor, max_val: float = 1) -> torch.Tensor:
+    """
+    Нормирует матрицу.
+
+    """
+    eps = 1e-10  # Для избежания деления на 0
+    matrix_norm = matrix / (max_val + eps)
+    return matrix_norm
+
+
+def optics_matmul_shift(sim, tensor_1, tensor_2):
+
+    if torch.min(tensor_1) >= 0 and torch.min(tensor_2) >= 0:
+        max_abs = abs(max(torch.max(tensor_1), torch.max(tensor_2)))
+        a, b =  optics_norm(tensor_1, max_abs), optics_norm(tensor_2, max_abs)
+        return sim(a, b) * max_abs **2
+
+    min_abs = abs(min(torch.min(tensor_1), torch.min(tensor_2)))
+    max_abs = abs(max(torch.max(tensor_1), torch.max(tensor_2))) + min_abs
+
+    shift_a = min_abs * torch.ones(tensor_1.shape).to(tensor_1.device)
+    shift_b = min_abs * torch.ones(tensor_2.shape).to(tensor_1.device)
+    a_a_sh = tensor_1 + shift_a
+    b_b_sh = tensor_2 + shift_b
+
+    a_a_sh_norm, b_b_sh_norm = optics_norm(a_a_sh, max_abs), optics_norm(b_b_sh, max_abs)
+    shift_a_norm, shift_b_norm = optics_norm(shift_a, max_abs), optics_norm(shift_b, max_abs) 
+    a_a_sh_b_b_sh = sim(a_a_sh_norm, b_b_sh_norm)
+    a_a_sh_b_sh = sim(a_a_sh_norm, shift_b_norm)
+    a_sh_b_b_sh = sim(shift_a_norm, b_b_sh_norm)
+    a_sh_b_sh = sim(shift_a_norm, shift_b_norm)
+    return (a_a_sh_b_b_sh - a_a_sh_b_sh - a_sh_b_b_sh + a_sh_b_sh) * max_abs ** 2
 
 
 def norm(x):
@@ -47,6 +121,65 @@ def apply_rotary_emb(x, cos, sin):
     out = torch.cat([y1, y2], 3) # re-assemble
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
+
+
+class OpticalSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        self.k1_is_initialized = False
+        self.k1 = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.k2_is_initialized = False
+        self.k2 = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+
+    def forward(self, x, cos_sin, kv_cache):
+        
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
+        q, k = norm(q), norm(k) # QK norm
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+
+        attention_scores = optics_matmul_shift(sim_scores, q, k.transpose(-1, -2))
+        if not self.k1_is_initialized:
+            _attention_scores = q.detach() @ k.transpose(-1, -2).detach()
+            k_sim1 = torch.max(_attention_scores) / torch.max(attention_scores)
+            self.k1.data = k_sim1
+            self.k1_is_initialized = True
+        attention_scores = attention_scores * self.k1 * (self.head_dim ** -0.5)
+        attention_probs = nn.functional.softmax(attention_scores, dim=2)
+
+        attention_output = optics_matmul_shift(sim_output, attention_probs, v)
+        if not self.k2_is_initialized:
+            _attention_output = attention_probs.detach() @ v.detach()
+            k_sim2 = torch.max(_attention_output) / torch.max(attention_output)
+            self.k2.data = k_sim2
+            self.k2_is_initialized = True
+        attention_output = attention_output * self.k2
+
+        # Re-assemble the heads side by side and project back to residual stream
+        y = attention_output.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -126,7 +259,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = OpticalSelfAttention(config, layer_idx) if USE_OPTICA else CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
