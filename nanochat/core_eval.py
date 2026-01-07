@@ -195,8 +195,8 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
 
     # Some models can't forward sequences beyond a certain length (e.g. GPT-2)
     # In these cases, we have to truncate sequences to max length and adjust the indices
-    if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
-        max_tokens = model.max_seq_len
+    if hasattr(model.config, 'sequence_len') and model.config.sequence_len is not None:
+        max_tokens = model.config.sequence_len
         new_tokens, new_start_idxs, new_end_idxs = [], [], []
         for t, s, e in zip(tokens, start_idxs, end_idxs):
             if len(t) > max_tokens:

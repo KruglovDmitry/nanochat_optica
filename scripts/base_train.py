@@ -13,7 +13,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1,2,3,4,5,6,7"
+os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1,2,3,4,5"
 import time
 from contextlib import nullcontext
 
@@ -25,7 +25,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_d
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_bpb, perplexity
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
@@ -43,8 +43,8 @@ num_iterations = -1 # explicit number of steps of the optimization (-1 = disable
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 4 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
+device_batch_size = 6 # per-device batch size (set to not OOM)
+total_batch_size = 522240 # 524288 # total desired batch size, in #tokens
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
@@ -55,6 +55,7 @@ warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
 # Evaluation
+ppx_eval_steps = 10 # perplexity evaluation steps
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 512 # 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
@@ -230,11 +231,13 @@ while True:
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+            ppl = perplexity(model, val_loader, ppx_eval_steps)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f} | Perplexity: {ppl}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         if writer:
             writer.add_scalar("val/bpb", val_bpb, step)
+            writer.add_scalar("val/ppl", ppl, step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -280,6 +283,7 @@ while True:
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
+                "val_ppl": ppl,
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": device_batch_size,
@@ -378,6 +382,7 @@ get_report().log(section="Base model training", data=[
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
         "Final validation bpb": val_bpb,
+        "Final perplexity:": ppl,
         "CORE metric estimate": results.get("core_metric", None),
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",

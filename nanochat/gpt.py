@@ -44,23 +44,10 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 USE_OPTICA = True
 max_seq_len: int =  512
 
-config_scores = source.Config(right_matrix_count_columns = GPTConfig.sequence_len,
-                    right_matrix_count_rows = GPTConfig.sequence_len // GPTConfig.n_layer,
-                    right_matrix_width = pixel_size * GPTConfig.sequence_len,
-                    right_matrix_height = pixel_size * (GPTConfig.sequence_len // GPTConfig.n_layer),
-                    min_height_gap = pixel_size,
-                    right_matrix_split_x = 2,
-                    right_matrix_split_y = 2,
-                    left_matrix_split_x = 2,
-                    left_matrix_split_y = 2,
-                    result_matrix_split = 2,
-                    distance = 0.15,
-                    lens_size = 8192 * 2)
-
-config_output = source.Config(right_matrix_count_columns = GPTConfig.sequence_len // GPTConfig.n_layer,
-                    right_matrix_count_rows = GPTConfig.sequence_len,
-                    right_matrix_width = pixel_size * (GPTConfig.sequence_len // GPTConfig.n_layer),
-                    right_matrix_height = pixel_size * GPTConfig.sequence_len,
+config = source.Config(right_matrix_count_columns = max_seq_len,
+                    right_matrix_count_rows = max_seq_len,
+                    right_matrix_width = pixel_size * max_seq_len,
+                    right_matrix_height = pixel_size * max_seq_len,
                     min_height_gap = pixel_size,
                     right_matrix_split_x = 2,
                     right_matrix_split_y = 2,
@@ -70,41 +57,56 @@ config_output = source.Config(right_matrix_count_columns = GPTConfig.sequence_le
                     distance = 0.15,
                     lens_size = 8192 * 2)
         
-sim_scores = source.DataParallel(source.OpticalMul(config_scores))
-sim_output = source.DataParallel(source.OpticalMul(config_output))                    
+sim = source.OpticalDataParallel(source.OpticalMul(config))                 
 
-def optics_norm(matrix: torch.Tensor, max_val: float = 1) -> torch.Tensor:
-    """
-    Нормирует матрицу.
+def optics_matmul(sim, tensor_1, tensor_2):
+    # Шаг 1: Разделяем на положительные и отрицательные части
+    # A_pos содержит все положительные значения из A, остальные 0
+    # A_neg содержит модули всех отрицательных значений из A, остальные 0
+    A_pos = torch.clamp(tensor_1, min=0)      # A⁺ = max(A, 0)
+    A_neg = torch.clamp(-tensor_1, min=0)     # A⁻ = max(-A, 0)
+    B_pos = torch.clamp(tensor_2, min=0)      # B⁺ = max(B, 0)
+    B_neg = torch.clamp(-tensor_2, min=0)     # B⁻ = max(-B, 0)
+    
+    # Шаг 2: Находим максимальные значения для нормировки
+    max_A_pos = torch.max(A_pos)  # Может быть 0, если нет положительных значений
+    max_A_neg = torch.max(A_neg)  # Может быть 0, если нет отрицательных значений
+    max_B_pos = torch.max(B_pos)
+    max_B_neg = torch.max(B_neg)
 
-    """
-    eps = 1e-10  # Для избежания деления на 0
-    matrix_norm = matrix / (max_val + eps)
-    return matrix_norm
-
-
-def optics_matmul_shift(sim, tensor_1, tensor_2):
-
-    if torch.min(tensor_1) >= 0 and torch.min(tensor_2) >= 0:
-        max_abs = abs(max(torch.max(tensor_1), torch.max(tensor_2)))
-        a, b =  optics_norm(tensor_1, max_abs), optics_norm(tensor_2, max_abs)
-        return sim(a, b) * max_abs **2
-
-    min_abs = abs(min(torch.min(tensor_1), torch.min(tensor_2)))
-    max_abs = abs(max(torch.max(tensor_1), torch.max(tensor_2))) + min_abs
-
-    shift_a = min_abs * torch.ones(tensor_1.shape).to(tensor_1.device)
-    shift_b = min_abs * torch.ones(tensor_2.shape).to(tensor_1.device)
-    a_a_sh = tensor_1 + shift_a
-    b_b_sh = tensor_2 + shift_b
-
-    a_a_sh_norm, b_b_sh_norm = optics_norm(a_a_sh, max_abs), optics_norm(b_b_sh, max_abs)
-    shift_a_norm, shift_b_norm = optics_norm(shift_a, max_abs), optics_norm(shift_b, max_abs) 
-    a_a_sh_b_b_sh = sim(a_a_sh_norm, b_b_sh_norm)
-    a_a_sh_b_sh = sim(a_a_sh_norm, shift_b_norm)
-    a_sh_b_b_sh = sim(shift_a_norm, b_b_sh_norm)
-    a_sh_b_sh = sim(shift_a_norm, shift_b_norm)
-    return (a_a_sh_b_b_sh - a_a_sh_b_sh - a_sh_b_b_sh + a_sh_b_sh) * max_abs ** 2
+    # Заранее создаём шаблон нулевого тензора
+    zero_template = torch.zeros_like(
+                        torch.empty(tensor_1.shape[0],tensor_1.shape[1], tensor_1.shape[2], tensor_2.shape[3]))
+    
+    # Шаг 3: Вычисляем 4 компонента с защитой от деления на 0
+    
+    # Компонент 1: A⁺ × B⁺
+    if max_A_pos > 0 and max_B_pos > 0:
+        term1 = sim(A_pos / max_A_pos, B_pos / max_B_pos) * max_A_pos * max_B_pos
+    else:
+        term1 = zero_template.clone().to(device)
+    
+    # Компонент 2: A⁺ × B⁻ (со знаком минус в финальной формуле)
+    if max_A_pos > 0 and max_B_neg > 0:
+        term2 = sim(A_pos / max_A_pos, B_neg / max_B_neg) * max_A_pos * max_B_neg
+    else:
+        term2 = zero_template.clone().to(device)
+    
+    # Компонент 3: A⁻ × B⁺ (со знаком минус в финальной формуле)
+    if max_A_neg > 0 and max_B_pos > 0:
+        term3 = sim(A_neg / max_A_neg, B_pos / max_B_pos) * max_A_neg * max_B_pos
+    else:
+        term3 = zero_template.clone().to(device)
+    
+    # Компонент 4: A⁻ × B⁻
+    if max_A_neg > 0 and max_B_neg > 0:
+        term4 = sim(A_neg / max_A_neg, B_neg / max_B_neg) * max_A_neg * max_B_neg
+    else:
+        term4 = zero_template.clone().to(device)
+    
+    # Шаг 4: Собираем результат по формуле A⁺B⁺ - A⁺B⁻ - A⁻B⁺ + A⁻B⁻
+    result = term1 - term2 - term3 + term4
+    return result
 
 
 def norm(x):
@@ -138,13 +140,10 @@ class OpticalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-        self.k1_is_initialized = False
-        self.k1 = nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        self.k2_is_initialized = False
-        self.k2 = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.k1 = nn.Parameter(torch.randn(1, 1))
+        self.k2 = nn.Parameter(torch.randn(1, 1))
 
     def forward(self, x, cos_sin, kv_cache):
-        
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -152,30 +151,44 @@ class OpticalSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # Apply Rotary Embeddings
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        attention_scores = optics_matmul_shift(sim_scores, q, k.transpose(-1, -2))
-        if not self.k1_is_initialized:
-            _attention_scores = q.detach() @ k.transpose(-1, -2).detach()
-            k_sim1 = torch.max(_attention_scores) / torch.max(attention_scores)
-            self.k1.data = k_sim1
-            self.k1_is_initialized = True
-        attention_scores = attention_scores * self.k1 * (self.head_dim ** -0.5)
+        # Apply KV cache
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        
+        Tq = q.size(2)  # number of queries
+        Tk = k.size(2)  # number of keys
+        
+        # Вычисляем attention scores через оптическое умножение
+        attention_scores = self.k1.squeeze() * optics_matmul(sim, q, k.transpose(-1, -2)) * (self.head_dim ** -0.5)
+        
+        # CAUSAL MASK
+        if kv_cache is None or Tq == Tk:
+            # Training mode or first-time generation: use causal mask
+            attn_mask = torch.tril(torch.ones(Tq, Tk, device=q.device)).bool()
+            attention_scores = attention_scores.masked_fill(~attn_mask, float('-inf'))
+        elif Tq == 1:
+            # Inference with single token: no mask needed
+            pass  # No masking for single token
+        else:
+            # Inference with chunk of tokens
+            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
+            prefix_len = Tk - Tq
+            if prefix_len > 0:
+                attn_mask[:, :prefix_len] = True  # Can attend to prefix
+            # Causal within chunk
+            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+            attention_scores = attention_scores.masked_fill(~attn_mask, float('-inf'))
+
         attention_probs = nn.functional.softmax(attention_scores, dim=2)
-
-        attention_output = optics_matmul_shift(sim_output, attention_probs, v)
-        if not self.k2_is_initialized:
-            _attention_output = attention_probs.detach() @ v.detach()
-            k_sim2 = torch.max(_attention_output) / torch.max(attention_output)
-            self.k2.data = k_sim2
-            self.k2_is_initialized = True
-        attention_output = attention_output * self.k2
-
-        # Re-assemble the heads side by side and project back to residual stream
+        attention_output = self.k2.squeeze() * optics_matmul(sim, attention_probs, v)
+        
+        # Re-assemble the heads side by side and project back
         y = attention_output.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y

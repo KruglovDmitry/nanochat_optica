@@ -3,6 +3,7 @@ A number of functions that help with evaluating a base model.
 """
 import math
 import torch
+import numpy as np
 import torch.distributed as dist
 
 @torch.no_grad()
@@ -63,3 +64,33 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         return float('inf')
     bpb = total_nats / (math.log(2) * total_bytes)
     return bpb
+
+
+@torch.no_grad()
+def perplexity(model, batches, steps=None):
+    losses = []
+    batch_iter = iter(batches)
+    
+    if steps is None or steps == 0:
+        # Итерируемся по всему датасету
+        try:
+            while True:
+                x, y = next(batch_iter)
+                loss2d = model(x, y, loss_reduction='none')  # (B, T)
+                loss2d = loss2d.view(-1)  # flatten
+                losses.append(loss2d.mean().item())
+        except StopIteration:
+            # Достигнут конец датасета
+            pass
+    else:
+        # Используем фиксированное количество шагов
+        for _ in range(steps):
+            x, y = next(batch_iter)
+            loss2d = model(x, y, loss_reduction='none')  # (B, T)
+            loss2d = loss2d.view(-1)  # flatten
+            losses.append(loss2d.mean().item())
+    
+    if not losses:
+        return float('inf')
+    
+    return np.exp(np.mean(losses))
