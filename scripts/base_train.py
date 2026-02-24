@@ -13,7 +13,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1,2,3,4,5"
+os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1,2,3"
 import time
 from contextlib import nullcontext
 
@@ -32,7 +32,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # User settings
-run = "nanochat_optica" # wandb run name default ("dummy" is special - we won't log to wandb)
+run = "nanochat_optica_trained_512" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "cuda" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
@@ -43,7 +43,7 @@ num_iterations = -1 # explicit number of steps of the optimization (-1 = disable
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 6 # per-device batch size (set to not OOM)
+device_batch_size = 4 # per-device batch size (set to not OOM)
 total_batch_size = 522240 # 524288 # total desired batch size, in #tokens
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
@@ -55,7 +55,7 @@ warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
 # Evaluation
-ppx_eval_steps = 10 # perplexity evaluation steps
+ppx_eval_steps = 100 # perplexity evaluation steps
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 512 # 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)

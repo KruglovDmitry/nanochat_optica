@@ -37,27 +37,12 @@ class GPTConfig:
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
 
-step = 1
-pixel_size: float = 3.6e-6
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 USE_OPTICA = True
-max_seq_len: int =  512
 
-config = source.Config(right_matrix_count_columns = max_seq_len,
-                    right_matrix_count_rows = max_seq_len,
-                    right_matrix_width = pixel_size * max_seq_len,
-                    right_matrix_height = pixel_size * max_seq_len,
-                    min_height_gap = pixel_size,
-                    right_matrix_split_x = 2,
-                    right_matrix_split_y = 2,
-                    left_matrix_split_x = 2,
-                    left_matrix_split_y = 2,
-                    result_matrix_split = 2,
-                    distance = 0.15,
-                    lens_size = 8192 * 2)
-        
-sim = source.OpticalDataParallel(source.OpticalMul(config))                 
+step = 1
+simulator_size: int =  512  
+pixel_size: float = 3.6e-6
+device = 'cuda' if torch.cuda.is_available() else 'cpu'         
 
 def optics_matmul(sim, tensor_1, tensor_2):
     # Шаг 1: Разделяем на положительные и отрицательные части
@@ -126,8 +111,9 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class OpticalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, sim):
         super().__init__()
+        self.sim = sim
         self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
@@ -139,9 +125,6 @@ class OpticalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-
-        self.k1 = nn.Parameter(torch.randn(1, 1))
-        self.k2 = nn.Parameter(torch.randn(1, 1))
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -165,7 +148,7 @@ class OpticalSelfAttention(nn.Module):
         Tk = k.size(2)  # number of keys
         
         # Вычисляем attention scores через оптическое умножение
-        attention_scores = self.k1.squeeze() * optics_matmul(sim, q, k.transpose(-1, -2)) * (self.head_dim ** -0.5)
+        attention_scores = optics_matmul(self.sim, q, k.transpose(-1, -2)) * (self.head_dim ** -0.5)
         
         # CAUSAL MASK
         if kv_cache is None or Tq == Tk:
@@ -186,7 +169,7 @@ class OpticalSelfAttention(nn.Module):
             attention_scores = attention_scores.masked_fill(~attn_mask, float('-inf'))
 
         attention_probs = nn.functional.softmax(attention_scores, dim=2)
-        attention_output = self.k2.squeeze() * optics_matmul(sim, attention_probs, v)
+        attention_output = optics_matmul(self.sim, attention_probs, v)
         
         # Re-assemble the heads side by side and project back
         y = attention_output.transpose(1, 2).contiguous().view(B, T, -1)
@@ -270,9 +253,9 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, sim):
         super().__init__()
-        self.attn = OpticalSelfAttention(config, layer_idx) if USE_OPTICA else CausalSelfAttention(config, layer_idx)
+        self.attn = OpticalSelfAttention(config, layer_idx, sim) if USE_OPTICA else CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
@@ -284,10 +267,24 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.sim = source.OpticalDataParallel(
+                    source.OpticalMul(
+                        source.Config(right_matrix_count_columns = simulator_size,
+                            right_matrix_count_rows = simulator_size,
+                            right_matrix_width = pixel_size * simulator_size,
+                            right_matrix_height = pixel_size * simulator_size,
+                            min_height_gap = pixel_size,
+                            right_matrix_split_x = 2,
+                            right_matrix_split_y = 2,
+                            left_matrix_split_x = 2,
+                            left_matrix_split_y = 2,
+                            result_matrix_split = 2,
+                            distance = 0.15,
+                            lens_size = 8192 * 2)))  
         self.config = config
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, self.sim) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
